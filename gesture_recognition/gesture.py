@@ -2,7 +2,9 @@ import cv2
 import numpy as np
 import json
 import os
+import pyttsx3
 from tensorflow.keras.models import load_model
+import mediapipe as mp
 
 # ----------------------
 # Load Model
@@ -25,6 +27,30 @@ else:
     print("⚠️ class_labels.json not found, using hardcoded labels.")
 
 # ----------------------
+# Initialize Text-to-Speech
+# ----------------------
+engine = pyttsx3.init()
+engine.setProperty("rate", 150)
+engine.setProperty("volume", 1.0)
+
+last_label = None
+no_gesture_counter = 0
+NO_GESTURE_FRAMES = 5  # frames needed before saying "No Gesture Identified"
+
+# ----------------------
+# Initialize MediaPipe Hands
+# ----------------------
+mp_hands = mp.solutions.hands  # type: ignore
+mp_draw = mp.solutions.drawing_utils  # type: ignore
+
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.5
+)
+
+# ----------------------
 # Start Webcam
 # ----------------------
 cap = cv2.VideoCapture(0)
@@ -38,115 +64,66 @@ while True:
         break
 
     frame = cv2.flip(frame, 1)
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb_frame)
 
-    # ROI
-    x1, y1, x2, y2 = 320, 100, 620, 400
-    roi = frame[y1:y2, x1:x2]
+    label = "No Gesture Identified"
+    max_confidence = 0.0
 
-    # Preprocess
-    roi_resized = cv2.resize(roi, (128, 128))  # resize correctly
-    roi_rgb = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2RGB)  # convert to RGB
-    roi_input = roi_rgb.astype("float32") / 255.0
-    roi_input = np.expand_dims(roi_input, axis=0)  # add batch dimension
-    
-    # Prediction
-    preds = classifier.predict(roi_input, verbose=0)
-    result = int(np.argmax(preds))
-    confidence = float(np.max(preds))
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            # Get bounding box around hand
+            h, w, c = frame.shape
+            x_coords = [lm.x for lm in hand_landmarks.landmark]
+            y_coords = [lm.y for lm in hand_landmarks.landmark]
+            x1, y1 = int(min(x_coords) * w) - 20, int(min(y_coords) * h) - 20
+            x2, y2 = int(max(x_coords) * w) + 20, int(max(y_coords) * h) + 20
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
 
-    # Draw
-    display_frame = frame.copy()
-    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 0, 0), 3)
-    label = class_labels.get(result, "Unknown")
-    text = f"{label} ({confidence:.2f})"
-    cv2.putText(display_frame, text, (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            roi = frame[y1:y2, x1:x2]
 
-    cv2.imshow("Gesture Recognition", display_frame)
+            # Preprocess for classifier
+            roi_resized = cv2.resize(roi, (128, 128))
+            roi_rgb = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2RGB)
+            roi_input = roi_rgb.astype("float32") / 255.0
+            roi_input = np.expand_dims(roi_input, axis=0)
 
-    if cv2.waitKey(1) == 13:  # Enter key
+            # Predict gesture
+            preds = classifier.predict(roi_input, verbose=0)
+            max_confidence = float(np.max(preds))
+            result = int(np.argmax(preds))
+
+            if max_confidence > 0.7:
+                label = class_labels.get(result, "Unknown")
+                no_gesture_counter = 0
+            else:
+                no_gesture_counter += 1
+                if no_gesture_counter >= NO_GESTURE_FRAMES:
+                    label = "No Gesture Identified"
+                else:
+                    label = last_label  # keep previous label
+
+            # Draw bounding box and hand landmarks
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 3)
+            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+    # Speak gesture if changed
+    if label != last_label:
+        engine.say(label)
+        engine.runAndWait()
+        last_label = label
+
+    # Draw label on frame
+    text = f"{label} ({max_confidence:.2f})"
+    cv2.putText(frame, text, (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+
+    cv2.imshow("Gesture Recognition (Hand Detection)", frame)
+
+    if cv2.waitKey(1) == 13:  # Enter key to exit
         break
 
 cap.release()
 cv2.destroyAllWindows()
-
-
-"""
-import cv2
-import os
-import time
-
-# ----------------------
-# Create directory if it doesn't exist
-# ----------------------
-def makedir(path):
-    os.makedirs(path, exist_ok=True)
-
-# ----------------------
-# Parameters
-# ----------------------
-gestures = [
-    ("Compass", "compass"),
-    ("Spool", "spool"),
-    ("Plier", "plier"),
-    ("Hemostatic_Forceps", "hemostatic_forceps"),
-    ("Kelly_Hemostatic_Forceps", "kelly_hemostatic_forceps")
-]
-
-images_per_gesture = 500   # Number of images to collect
-delay_between_images = 0.2  # seconds
-
-# ----------------------
-# Start camera
-# ----------------------
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Error: Cannot open webcam")
-    exit()
-
-for gesture_name, folder_name in gestures:
-    image_count = 0
-    gesture_path = f"./handgestures/train/{folder_name}/"
-    makedir(gesture_path)
-    print(f"\n📸 Get ready to record gesture: {gesture_name}")
-    print("Starting in 3 seconds...")
-    time.sleep(3)  # small delay before starting
-
-    while image_count < images_per_gesture:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-
-        frame = cv2.flip(frame, 1)
-
-        # ROI
-        x1, y1, x2, y2 = 320, 100, 620, 400
-        roi = frame[y1:y2, x1:x2]
-
-        # Preprocess
-        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        roi_resized = cv2.resize(roi_gray, (64, 64), interpolation=cv2.INTER_AREA)
-
-        # Draw rectangle and label
-        display_frame = frame.copy()
-        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 0, 0), 3)
-        cv2.putText(display_frame, f"{gesture_name} ({image_count+1}/{images_per_gesture})",
-                    (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-        cv2.imshow("Capture Gestures", display_frame)
-
-        # Save image
-        cv2.imwrite(os.path.join(gesture_path, f"{image_count+1}.jpg"), roi_resized)
-        image_count += 1
-        time.sleep(delay_between_images)  # small delay between captures
-
-        # Exit if Enter key is pressed
-        if cv2.waitKey(1) == 13:
-            print("Interrupted by user")
-            cap.release()
-            cv2.destroyAllWindows()
-            exit()
-
-print("\n✅ Finished capturing all gestures")
-cap.release()
-cv2.destroyAllWindows()"""
+hands.close()
